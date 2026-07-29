@@ -1,0 +1,420 @@
+import torch
+from .utils import *
+from tqdm import tqdm
+
+def _chisq_sample(df, shape, device, dtype):
+    """
+    Sample Chi-square(df) using sum of squared Gaussians.
+    Requires df to be an integer.
+    """
+    if isinstance(df, torch.Tensor):
+        df = df.item()
+
+    assert float(df).is_integer(), "df must be an integer for this sampler"
+    df = int(df)
+
+    z = torch.randn(*shape, df, device=device, dtype=dtype)
+    return z.pow_(2).sum(dim=-1)
+
+def _log_iso_student_t_unnorm(y, mu, sigma, nu):
+    """
+    Log multivariate t density up to an additive constant:
+
+      t_nu(y | mu, sigma^2 I)
+
+    ignoring terms that do not depend on y.
+
+    y, mu: (..., D)
+    sigma: scalar
+    nu:    scalar
+    """
+    sigma2 = sigma * sigma
+    D = y.shape[-1]
+    quad = (y - mu).pow(2).sum(dim=-1) / sigma2
+    return -0.5 * (nu + D) * torch.log1p(quad / nu)
+
+
+def student_t_noise(z, u, nu):
+    """
+    Construct multivariate standard t noise from
+      z ~ N(0, I), u ~ ChiSq(nu), independent
+
+      eps = z / sqrt(u/nu)
+
+    z: (..., D)
+    u: (...,)
+    returns: (..., D)
+    """
+    return z / torch.sqrt(u[..., None] / nu)
+
+
+def student_t_maximal_coupling(x1, x_ref, z,  sigma, nu, max_tries=10_000):
+    """
+    Maximal coupling of t_nu(x_ref, sigma^2 I) and t_nu(x1, sigma^2 I)
+    using the generic accept-reject construction, WITHOUT reflection.
+
+    Inputs are single vectors:
+      x1, x_ref, z: (D,)
+      sigma:        scalar
+      nu:           scalar degrees of freedom
+
+    Returns:
+      y1:       sample from t_nu(x1, sigma^2 I) coupled with y_ref
+      eps_used: standardized noise, i.e. (y1 - x1) / sigma
+    """
+    device = x_ref.device
+    dtype  = x_ref.dtype
+    sigma  = torch.as_tensor(sigma, device=device, dtype=dtype)
+    nu     = torch.as_tensor(nu,    device=device, dtype=dtype)
+
+    # 1) draw from reference
+    y_ref   = x_ref + sigma * z 
+
+    logp = _log_iso_student_t_unnorm(y_ref, x_ref, sigma, nu)
+    logq = _log_iso_student_t_unnorm(y_ref, x1,   sigma, nu)
+
+    # Coalescence with prob min(1, q(y_ref)/p(y_ref))
+    logu = torch.rand((), device=device, dtype=dtype).log()
+    if logu <= (logq - logp):
+        y1 = y_ref
+        return y1, (y1 - x1) / sigma
+
+    # 2) otherwise sample Y ~ (q - min(p,q)) / (1 - overlap)
+    # Rejection sampling from q with acceptance prob 1 - min(1, p/q).
+    for _ in range(max_tries):
+        z1 = torch.randn_like(z)
+        u1 = _chisq_sample(nu, (), device=device, dtype=dtype)
+        eps1 = student_t_noise(z1, u1, nu)
+        y1 = x1 + sigma * eps1
+
+        logp_y = _log_iso_student_t_unnorm(y1, x_ref, sigma, nu)
+        logq_y = _log_iso_student_t_unnorm(y1, x1,   sigma, nu)
+
+        # min(1, p/q) = exp(min(0, logp - logq))
+        log_min_1_p_over_q = torch.minimum(
+            torch.zeros((), device=device, dtype=dtype),
+            logp_y - logq_y
+        )
+
+        logv = torch.rand((), device=device, dtype=dtype).log()
+
+        # accept if v > min(1, p/q)
+        if logv > log_min_1_p_over_q:
+            return y1, eps1
+
+    raise RuntimeError("student_t_maximal_coupling: max_tries exceeded")
+
+
+def mh_tstudent(x0, log_target_func, sigma, nu, *, len_gen=2**19):
+    """
+    Random-walk Metropolis-Hastings with isotropic multivariate Student-t proposal:
+
+        x' = x + sigma * eps,
+        eps ~ t_nu(0, I)
+
+    Since the proposal is symmetric, the MH ratio is just
+        log pi(x') - log pi(x).
+
+    Returns:
+      xs:       (len_gen + 1, D) chain states
+      zs:       (len_gen, D) student-t noise
+      us:       (len_gen,) uniforms for rejection
+    """
+    x_c = x0.clone()
+    device = x0.device
+    dtype = x0.dtype
+
+    sigma = torch.as_tensor(sigma, device=device, dtype=dtype)
+    nu = torch.as_tensor(nu, device=device, dtype=dtype)
+
+    list_z, list_u = [], []
+    list_x = [x_c.clone()]
+
+    logp_c = log_target_func(x_c)
+
+    for _ in range(len_gen):
+        # latent representation of multivariate Student-t noise
+        z = torch.randn_like(x0)
+        u = _chisq_sample(nu, (), device=device, dtype=dtype)
+        eps = student_t_noise(z, u, nu)
+
+        # Student-t proposal
+        x_p = x_c + sigma * eps
+        logp_p = log_target_func(x_p)
+
+        # symmetric random-walk proposal => no proposal correction term
+        log_alpha = logp_p - logp_c
+        mh_u = torch.rand((), device=device, dtype=dtype)
+
+        if mh_u.log() < torch.minimum(log_alpha, torch.zeros_like(log_alpha)):
+            x_c = x_p
+            logp_c = logp_p
+
+        list_x.append(x_c.clone())
+        list_z.append(eps)
+        list_u.append(mh_u)
+
+    return torch.stack(list_x), torch.stack(list_z), torch.stack(list_u)
+
+
+def maxcoupl_2step(x0, *, ref_chain, z_ref, u_ref, log_target_func, sigma, nu):
+    """
+    Coupled MH chain against a reference MH chain with Student-t random-walk proposals.
+
+    Assumes:
+      - ref_chain was generated by mh_tstudent
+      - z_ref[i] is the standardized proposal noise eps used at step i, i.e.
+            ref_chain[i+1] proposal before accept/reject was
+            x_ref + sigma * z_ref[i]
+      - u_ref[i] is the MH accept-uniform used at step i
+
+    Returns:
+      list_x: coupled chain states
+      list_z: coupled proposal noises used for this chain
+      u_ref:  reused MH uniforms
+    """
+    if nu is None:
+        raise ValueError("maxcoupl_2step requires nu for Student-t coupling")
+
+    len_gen = len(z_ref)
+    device = x0.device
+    dtype = x0.dtype
+
+    x_c = x0.clone()
+
+    list_z = torch.full_like(z_ref, torch.inf)
+    list_x = torch.full_like(ref_chain, torch.inf)
+    list_x[0] = x_c.clone()
+
+    sigma = torch.as_tensor(sigma, device=device, dtype=dtype)
+    nu = torch.as_tensor(nu, device=device, dtype=dtype)
+
+    for i in range(len_gen):
+        eps_ref = z_ref[i]         # standardized t noise actually used by reference proposal
+        x_ref = ref_chain[i]
+        u = u_ref[i]
+
+        # Couple t_nu(x_ref, sigma^2 I) and t_nu(x_c, sigma^2 I)
+        #
+        # student_t_maximal_coupling currently takes arguments (x1, x_ref, z,  ...)
+        # but it only uses z to form the realized reference proposal y_ref = x_ref + sigma * z.
+        # So passing eps_ref here is consistent.
+        x_p, eps_used = student_t_maximal_coupling(
+            x1=x_c,
+            x_ref=x_ref,
+            z=eps_ref,
+            sigma=sigma,
+            nu=nu,
+        )
+
+        log_alpha = log_target_func(x_p) - log_target_func(x_c)
+
+        if u.log() < torch.minimum(log_alpha, torch.zeros_like(log_alpha)):
+            x_c = x_p
+
+        list_x[i + 1] = x_c.clone()
+        list_z[i] = eps_used
+
+        if (x_c - ref_chain[i + 1]).abs().sum() < 1e-8:
+            list_x[i + 2:] = ref_chain[i + 2:].clone()
+            list_z[i + 1:] = z_ref[i + 1:].clone()
+            break
+
+    assert torch.isfinite(list_x).all().item()
+    assert torch.isfinite(list_z).all().item()
+
+    return list_x, list_z, u_ref
+
+@torch.no_grad()
+def grand_maxcoupling_2steps(
+    init_xs,
+    num_chains,
+    log_target_func,
+    sigma,
+    nu,
+    tol=1e-8,
+    mode='sequential',
+    len_gen=2**19,
+):
+    if mode == 'sequential':
+        ref_chain_idx = -1
+    elif mode == 'star':
+        ref_chain_idx = 0
+    else:
+        raise ValueError("mode must be 'sequential' or 'star'")
+
+    if init_xs.shape[0] < num_chains:
+        raise ValueError("init_xs has fewer rows than num_chains")
+
+    all_list_x = []
+    all_list_z = []
+
+    # Run the first reference chain
+    list_x, list_z, list_u = mh_tstudent(
+        init_xs[0],
+        log_target_func=log_target_func,
+        sigma=sigma,
+        nu=nu,
+        len_gen=len_gen,
+    )
+    all_list_x.append(list_x)
+    all_list_z.append(list_z)
+
+    # Shared MH uniforms across all chains
+    all_list_u = list_u
+
+    # Couple the rest
+    for i in tqdm(range(1, num_chains)):
+        list_x_new, list_z_new, _ = maxcoupl_2step(
+            init_xs[i],
+            ref_chain=all_list_x[ref_chain_idx],
+            z_ref=all_list_z[ref_chain_idx],
+            u_ref=all_list_u,
+            log_target_func=log_target_func,
+            sigma=sigma,
+            nu=nu,
+        )
+
+        all_list_x.append(list_x_new)
+        all_list_z.append(list_z_new)
+
+    all_list_x = torch.stack(all_list_x)   # (num_chains, len_gen + 1, D)
+
+    # Check when all chains have met
+    meet = (
+        (all_list_x.min(dim=0).values - all_list_x.max(dim=0).values).abs() < tol
+    ).prod(dim=-1)
+
+    meet_locs = (meet == 1).nonzero(as_tuple=True)[0]
+    if len(meet_locs) == 0:
+        meet_index = None
+    else:
+        meet_index = meet_locs[0].item()
+
+    return all_list_x, meet_index
+
+@torch.no_grad()
+def grand_maxcoupling_1step(
+    init_xs, num_chains, log_target_func, sigma, nu,  tol=1e-8, mode='sequential', len_gen=2**19
+):
+    if mode == 'sequential':
+        ref_chain_idx = -1
+    elif mode == 'star':
+        ref_chain_idx = 0
+    
+    all_list_x = []
+    all_list_z = []
+
+    # run the first chain
+    list_x, list_z, list_u = mh_tstudent(
+        init_xs[0],
+        log_target_func=log_target_func,
+        sigma=sigma,
+        nu=nu,
+        len_gen=len_gen,
+    )
+    
+    all_list_x.append(list_x)
+    all_list_z.append(list_z)
+
+    # couple the rest
+    for i in tqdm(range(1, num_chains)):
+        list_x_new, list_z_new, _ = maxcoupl_1step(
+            init_xs[i],
+            ref_chain=all_list_x[ref_chain_idx],
+            z_ref=all_list_z[ref_chain_idx],
+            u_ref=list_u,
+            log_target_func=log_target_func,
+            sigma=sigma,
+            nu=nu
+        )
+
+        all_list_x.append(list_x_new)
+        all_list_z.append(list_z_new)
+
+
+    all_list_x = torch.stack(all_list_x)
+
+    meet = ((all_list_x.min(dim=0).values - all_list_x.max(dim=0).values).abs() < tol).prod(dim=-1)
+    meet_index = (meet == 1).nonzero(as_tuple=True)[0][0].item()
+
+    return all_list_x, meet_index
+
+def maxcoupl_1step(x0, *, ref_chain, z_ref, u_ref, log_target_func, sigma=1.0, nu=2.0):
+    len_gen = len(z_ref)
+    x_c = x0
+    list_z = torch.ones_like(z_ref) * torch.inf #[]
+    list_x = torch.ones_like(ref_chain) * torch.inf #[x_c.clone()]
+    list_x[0] = x_c.clone()
+
+    for i in range(len_gen):
+        z = z_ref[i]
+        x_ref = ref_chain[i]
+        x_ref_n = ref_chain[i+1]
+        u = u_ref[i]
+
+        x_c = tstudentMH_maximal_coupling(x_c, x_ref,x_ref_n, log_target_func, sigma=sigma, nu=nu)
+
+        list_x[i+1] = x_c.clone()
+
+        if (x_c - ref_chain[i+1]).abs().sum() < 1e-8:
+            #import pdb; pdb.set_trace()
+            list_x[i+2:] = ref_chain[i+2:].clone()
+            break
+    assert torch.isfinite(list_x).all().item()
+
+    return list_x, None, u_ref
+
+def tstudentMH_maximal_coupling(x1, x_ref_c, x_ref_n, log_target_func, sigma, nu, max_tries=10_000):
+    """
+    Maximal coupling of N(x_ref, sigma^2 I) and N(x1, sigma^2 I) WITHOUT reflection.
+
+    Inputs are single vectors:
+      x1, x_ref_c, x_ref_n: (D,)
+      sigma: scalar
+
+    Returns:
+      y1:     sample from N(x1, sigma^2 I) coupled with y_ref
+    """
+    device = x_ref_c.device
+    dtype  = x_ref_c.dtype
+    sigma  = torch.as_tensor(sigma, device=device, dtype=dtype)
+    logu = torch.rand((), device=device, dtype=dtype).log()
+
+    def compute_logfxy(x, y):
+        logq = _log_iso_student_t_unnorm(y, x, sigma, nu)  # log q(y|x)
+        logratio = log_target_func(y) - log_target_func(x)  # symmetric MH ratio in log
+        log_alpha = torch.minimum(logratio, torch.zeros((), device=logratio.device, dtype=logratio.dtype))
+        return logq + log_alpha
+
+    def draw_transition(y):
+        z = torch.randn_like(y)
+        u = _chisq_sample(nu, (), device=device, dtype=dtype)
+        eps = student_t_noise(z, u, nu)
+
+        # Student-t proposal        
+        y_ = y + sigma * eps
+
+        logu_ = torch.rand((), device=device, dtype=dtype).log()
+
+        if logu_ < log_target_func(y_) - log_target_func(y):
+            atom = False
+            return y_, atom
+        atom = True
+        return y, True
+
+    # 1) ref_chain do not sample a point mass:
+    if (x_ref_c - x_ref_n).abs().sum() > 1e-10 and logu <= compute_logfxy(x1, x_ref_n) - compute_logfxy(x_ref_c, x_ref_n):
+        return x_ref_n.clone()
+
+    for _ in range(max_tries):
+        y_p, atom = draw_transition(x1)
+        logv = torch.rand((), device=device, dtype=dtype).log()
+
+        if atom: return y_p
+
+        if logv > compute_logfxy(x_ref_c, y_p) - compute_logfxy(x1, y_p):
+            return y_p
+
+
+    raise RuntimeError("gaussianMH_maximal_coupling: max_tries exceeded")
